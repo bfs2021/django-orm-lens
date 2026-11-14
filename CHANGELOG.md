@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is a relation on at least one model, or on none, is still guessed at
   `medium`.
 
+- **signals: read the `signal=` argument to `@receiver`.** Single signals and
+  lists/tuples passed by keyword now retain their names and built-in markers
+  instead of appearing as `<unknown>` custom edges (#248).
+
 ## [py-1.18.0] - 2026-11-11
 
 > Fewer false drift alarms on django-oscar-style and moved models.

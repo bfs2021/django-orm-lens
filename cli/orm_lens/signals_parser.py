@@ -94,16 +94,18 @@ def _extract_receiver_call(dec: ast.AST) -> ast.Call | None:
 
 
 def _signal_arg_names(call: ast.Call) -> list[str]:
-    """Signal names in the first positional arg of ``receiver(...)``.
+    """Signal names in the positional argument or ``signal=`` keyword.
 
     Django accepts one signal (``post_save``) or a list/tuple of them
     (``[post_save, post_delete]``). Unreadable elements are skipped; when
     none can be read, returns an empty list and the caller records
     ``<unknown>`` once.
     """
-    if not call.args:
+    first = call.args[0] if call.args else next(
+        (kw.value for kw in call.keywords if kw.arg == "signal"), None
+    )
+    if first is None:
         return []
-    first = call.args[0]
     nodes = first.elts if isinstance(first, (ast.List, ast.Tuple)) else [first]
     names = [_name_of(node) for node in nodes]
     return [name for name in names if name is not None]

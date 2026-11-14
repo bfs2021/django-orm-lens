@@ -1,4 +1,4 @@
-"""Regression tests for ``@receiver`` with a list or tuple of signals.
+"""Regression tests for positional and keyword ``@receiver`` signals.
 
 Django's receiver accepts one signal or a list/tuple of them. The parser used
 to read the first positional argument as a single dotted name, so a list gave
@@ -121,3 +121,56 @@ class ReceiverSignalListTest(unittest.TestCase):
                     ("post_delete", "remove_file"),
                 },
             )
+
+
+class ReceiverSignalKeywordTest(unittest.TestCase):
+    def _edges(self, argument: str) -> list[dict]:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(
+                root / "media" / "models.py",
+                "from django.db import models\n\n"
+                "class Attachment(models.Model):\n"
+                "    file = models.FileField()\n",
+            )
+            _write(
+                root / "media" / "signals.py",
+                "from django.db.models.signals import post_delete, post_save\n"
+                "from django.dispatch import Signal, receiver\n"
+                "from .models import Attachment\n\n"
+                "periodic_task = Signal()\n\n"
+                f"@receiver({argument}, sender=Attachment)\n"
+                "def handle_change(sender, instance, **kwargs):\n"
+                "    pass\n",
+            )
+            return signal_graph(str(root))["edges"]
+
+    def test_keyword_signal_names_and_builtin_flags(self) -> None:
+        cases = [
+            ("signal=post_save", [("post_save", True)]),
+            ("signal=periodic_task", [("periodic_task", False)]),
+            (
+                "signal=[post_save, periodic_task, post_delete]",
+                [("post_save", True), ("periodic_task", False), ("post_delete", True)],
+            ),
+            ("signal=(post_delete,)", [("post_delete", True)]),
+        ]
+        for argument, expected in cases:
+            with self.subTest(argument=argument):
+                edges = self._edges(argument)
+                self.assertEqual(
+                    [(e["signal"], e.get("builtin", False)) for e in edges], expected
+                )
+                self.assertTrue(all(e["sender"] == "media.Attachment" for e in edges))
+
+    def test_keyword_unreadable_elements_and_missing_signal(self) -> None:
+        cases = [
+            ("signal=[]", ["<unknown>"]),
+            ("signal=()", ["<unknown>"]),
+            ("signal=make_signal()", ["<unknown>"]),
+            ("signal=[post_save, make_signal(), post_delete]", ["post_save", "post_delete"]),
+            ("dispatch_uid='refresh'", ["<unknown>"]),
+        ]
+        for argument, expected in cases:
+            with self.subTest(argument=argument):
+                self.assertEqual([e["signal"] for e in self._edges(argument)], expected)
