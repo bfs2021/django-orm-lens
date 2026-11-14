@@ -86,7 +86,15 @@
           "baseClasses": [
             "AbstractMessage"
           ],
-          "fields": [],
+          "fields": [
+            {
+              "args": "null=True",
+              "isRelation": false,
+              "lineNumber": 179,
+              "name": "search_tsvector",
+              "type": "SearchVectorField"
+            }
+          ],
           "filePath": "zerver/models/messages.py",
           "lineNumber": 166,
           "meta": {

@@ -340,6 +340,29 @@ class DetectDriftTest(unittest.TestCase):
         self.assertEqual(report.blocking_count, 0)
         self.assertIn("no drift", format_drift(report))
 
+    def test_directly_imported_array_field_matches_migration(self) -> None:
+        blog = self.root / "blog"
+        (blog / "models.py").write_text(
+            "from django.contrib.postgres.fields import ArrayField\n"
+            "from django.db import models\n\n"
+            "class Post(models.Model):\n"
+            "    title = models.CharField(max_length=100)\n"
+            "    tags = ArrayField(models.TextField(), default=list)\n",
+            encoding="utf-8",
+        )
+        (blog / "migrations" / "0002_add_tags.py").write_text(
+            "from django.contrib.postgres.fields import ArrayField\n"
+            + _migration(
+                '        migrations.AddField(model_name="post", name="tags", '
+                "field=ArrayField(models.TextField(), default=list)),\n",
+                '[("blog", "0001_initial")]',
+            ),
+            encoding="utf-8",
+        )
+
+        report = detect_drift(self.root)
+        self.assertEqual(report.drifted, [])
+
     def test_declared_but_unmigrated_field_blocks(self) -> None:
         report = self._detect({"blog": {"post": {"title", "slug"}}})
         self.assertEqual(len(report.drifted), 1)

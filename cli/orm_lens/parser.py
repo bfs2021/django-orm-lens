@@ -88,6 +88,11 @@ BARE_FIELD_TYPES = "|".join(
         "BooleanField", "NullBooleanField",
         "DateTimeField", "DateField", "TimeField", "DurationField",
         "JSONField", "BinaryField",
+        "GeneratedField",
+        "ArrayField", "HStoreField", "SearchVectorField",
+        "IntegerRangeField", "BigIntegerRangeField", "DecimalRangeField",
+        "DateRangeField", "DateTimeRangeField",
+        "CICharField", "CIEmailField", "CITextField",
         "FileField", "ImageField", "FilePathField",
         "GenericIPAddressField",
         "AutoField", "BigAutoField", "SmallAutoField",
@@ -382,24 +387,46 @@ def _extract_through_model_regex(args_block: str) -> str | None:
 
 
 def _read_balanced_args(lines: Sequence[str], start: int):
-    if "(" not in lines[start]:
+    open_idx = lines[start].find("(")
+    if open_idx == -1:
         return "", start
-    open_idx = lines[start].index("(")
-    depth = 0
+
+    depth = 1
+    quote = ""
     parts: list[str] = []
     for i in range(start, len(lines)):
-        src = lines[i][open_idx:] if i == start else lines[i]
-        for ch in src:
-            if ch == "(":
+        src = lines[i][open_idx + 1 :] if i == start else lines[i]
+        k = 0
+        while k < len(src):
+            ch = src[k]
+            if quote:
+                if ch == "\\":
+                    k += 2
+                    continue
+                if src.startswith(quote, k):
+                    k += len(quote)
+                    quote = ""
+                    continue
+            elif ch == "#":
+                break
+            elif ch in "'\"":
+                triple = ch * 3
+                quote = triple if src.startswith(triple, k) else ch
+                k += len(quote)
+                continue
+            elif ch == "(":
                 depth += 1
             elif ch == ")":
                 depth -= 1
                 if depth == 0:
-                    parts.append(")")
-                    return "".join(parts).lstrip("("), i
-            parts.append(ch)
-        parts.append("\n")
-    return "".join(parts).lstrip("("), len(lines) - 1
+                    parts.append(src[: k + 1])
+                    return "".join(parts), i
+            k += 1
+        # A single-quoted string can continue only via an escaped newline.
+        if len(quote) == 1 and k <= len(src):
+            quote = ""
+        parts.extend((src, "\n"))
+    return "".join(parts), len(lines) - 1
 
 
 def _encloses_only_blocks(lines: Sequence[str], idx: int, indent: int) -> bool:
@@ -663,16 +690,16 @@ def _collect_defs(file_path: str, content: str) -> list[ParsedModel]:
                     or (ftype if ftype in RELATION_TYPES else None)
                 )
                 is_rel = relation_kind is not None
+                inner = args_block.removesuffix(")")
                 field = ParsedField(
                     name=fname,
                     type=ftype,
-                    args=args_block.rstrip(")").strip(),
+                    args=inner.strip(),
                     is_relation=is_rel,
                     line_number=j,
                 )
                 if is_rel:
                     field.relation_kind = relation_kind  # type: ignore[assignment]
-                    inner = args_block.rstrip(")")
                     field.related_model = (
                         "taggit.Tag"
                         if ftype == "TaggableManager"

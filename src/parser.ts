@@ -149,6 +149,11 @@ const BARE_FIELD_TYPES = [
   'BooleanField', 'NullBooleanField',
   'DateTimeField', 'DateField', 'TimeField', 'DurationField',
   'JSONField', 'BinaryField',
+  'GeneratedField',
+  'ArrayField', 'HStoreField', 'SearchVectorField',
+  'IntegerRangeField', 'BigIntegerRangeField', 'DecimalRangeField',
+  'DateRangeField', 'DateTimeRangeField',
+  'CICharField', 'CIEmailField', 'CITextField',
   'FileField', 'ImageField', 'FilePathField',
   'GenericIPAddressField',
   'AutoField', 'BigAutoField', 'SmallAutoField',
@@ -254,23 +259,49 @@ function readBalancedArgs(lines: string[], startIdx: number): {
   endIdx: number;
 } {
   const openIdx = lines[startIdx].indexOf('(');
-  let depth = 0;
-  let buffer = '';
+  if (openIdx === -1) return { argsBlock: '', endIdx: startIdx };
+
+  let depth = 1;
+  let quote = '';
+  const parts: string[] = [];
   for (let i = startIdx; i < lines.length; i++) {
-    const src = i === startIdx ? lines[i].slice(openIdx) : lines[i];
-    for (const ch of src) {
-      if (ch === '(') depth++;
-      else if (ch === ')') {
+    const src = i === startIdx ? lines[i].slice(openIdx + 1) : lines[i];
+    let k = 0;
+    while (k < src.length) {
+      const ch = src[k];
+      if (quote) {
+        if (ch === '\\') {
+          k += 2;
+          continue;
+        }
+        if (src.startsWith(quote, k)) {
+          k += quote.length;
+          quote = '';
+          continue;
+        }
+      } else if (ch === '#') {
+        break;
+      } else if (ch === "'" || ch === '"') {
+        const triple = ch.repeat(3);
+        quote = src.startsWith(triple, k) ? triple : ch;
+        k += quote.length;
+        continue;
+      } else if (ch === '(') {
+        depth++;
+      } else if (ch === ')') {
         depth--;
         if (depth === 0) {
-          return { argsBlock: (buffer + ')').replace(/^\(/, ''), endIdx: i };
+          parts.push(src.slice(0, k + 1));
+          return { argsBlock: parts.join(''), endIdx: i };
         }
       }
-      buffer += ch;
+      k++;
     }
-    buffer += '\n';
+    // A single-quoted string can continue only via an escaped newline.
+    if (quote.length === 1 && k <= src.length) quote = '';
+    parts.push(src, '\n');
   }
-  return { argsBlock: buffer.replace(/^\(/, ''), endIdx: lines.length - 1 };
+  return { argsBlock: parts.join(''), endIdx: lines.length - 1 };
 }
 
 /**

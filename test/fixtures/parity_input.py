@@ -1,7 +1,23 @@
+from django.contrib.postgres.fields import ArrayField, HStoreField, IntegerRangeField
+from django.contrib.postgres.search import SearchVectorField
 from django.db import models
+from django.db.models import GeneratedField
+from django.db.models.functions import Lower
 
 class Author(models.Model):
     name = models.CharField(max_length=100)
+    aliases = ArrayField(ArrayField(models.TextField(), size=2))
+    tags = ArrayField(models.CharField(max_length=10, default="("))
+    punctuation = models.CharField(max_length=10, default='it\'s )')
+    blurb = models.TextField(default="""first (
+second (
+""")
+    attributes = HStoreField(default=dict)
+    years_active = IntegerRangeField(null=True)
+    search_document = SearchVectorField(null=True)
+    normalized_name = GeneratedField(
+        expression=Lower("name"), output_field=models.TextField(), db_persist=True
+    )
 
 
 class Book(models.Model):
