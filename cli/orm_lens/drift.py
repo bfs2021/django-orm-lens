@@ -164,15 +164,10 @@ def _create_model_fields(call: ast.Call) -> list[str]:
     return names
 
 
-def _module_level_lists(tree: ast.AST) -> dict[str, ast.expr]:
-    """Module-scope ``NAME = [...]`` bindings, by name.
-
-    Hand-written migrations sometimes hoist a shared operations list into a
-    constant and pass it as ``state_operations=NAME``. Those are statically
-    determinable, so resolve them instead of dropping the wrapper contents.
-    """
+def _body_lists(body: list[ast.stmt]) -> dict[str, ast.expr]:
+    """``NAME = [...]`` bindings in a module or class body, by name."""
     lists: dict[str, ast.expr] = {}
-    for node in getattr(tree, "body", []):
+    for node in body:
         if isinstance(node, ast.Assign):
             value = node.value
             names = [t.id for t in node.targets if isinstance(t, ast.Name)]
@@ -185,6 +180,16 @@ def _module_level_lists(tree: ast.AST) -> dict[str, ast.expr]:
             for name in names:
                 lists[name] = value
     return lists
+
+
+def _module_level_lists(tree: ast.AST) -> dict[str, ast.expr]:
+    """Module-scope ``NAME = [...]`` bindings, by name.
+
+    Hand-written migrations sometimes hoist a shared operations list into a
+    constant and pass it as ``state_operations=NAME``. Those are statically
+    determinable, so resolve them instead of dropping the wrapper contents.
+    """
+    return _body_lists(getattr(tree, "body", []))
 
 
 def _state_operations(elts: list[ast.expr], constants: dict[str, ast.expr]) -> list[ast.Call]:
@@ -222,15 +227,24 @@ def _state_operations(elts: list[ast.expr], constants: dict[str, ast.expr]) -> l
 def _operations(tree: ast.AST) -> list[ast.Call]:
     """Every call inside a ``Migration.operations = [...]`` list."""
     out: list[ast.Call] = []
-    constants = _module_level_lists(tree)
+    module_constants = _module_level_lists(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
         targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
         if "operations" not in targets:
             continue
-        if isinstance(node.value, (ast.List, ast.Tuple)):
-            out.extend(_state_operations(node.value.elts, constants))
+        if not isinstance(node.value, (ast.List, ast.Tuple)):
+            continue
+        # Django's own docs put shared lists on the ``Migration`` class, where
+        # the name is only bound inside that class body — so class bindings
+        # shadow (and extend) the module-level ones for this assignment.
+        constants = dict(module_constants)
+        for cls in ast.walk(tree):
+            if isinstance(cls, ast.ClassDef) and any(stmt is node for stmt in cls.body):
+                constants.update(_body_lists(cls.body))
+                break
+        out.extend(_state_operations(node.value.elts, constants))
     return out
 
 

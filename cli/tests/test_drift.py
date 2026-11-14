@@ -168,6 +168,26 @@ class ReplayTest(unittest.TestCase):
         state, _ = replay_app(self.migrations)
         self.assertEqual(state, {"entry": {"action"}})
 
+    def test_state_operations_bound_to_a_class_level_name_are_replayed(self) -> None:
+        # Django's own docs put the shared list on the Migration class rather
+        # than at module level, so the name is only bound inside the class body.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    state_operations = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(\n"
+            + "            state_operations=state_operations,\n"
+            + "        ),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
     def test_delete_model_drops_it(self) -> None:
         self._write(
             "0001_initial.py",
