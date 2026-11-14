@@ -955,5 +955,82 @@ class RealWorldPrecisionTest(unittest.TestCase):
         self.assertNotIn("conflicting_migration_leaves", _by_rule(findings))
 
 
+class DependencyOrderedIndexTest(unittest.TestCase):
+    """The migration index follows Django's order, not the filename order.
+
+    Index 0 is the one migration the analyzer assumes runs against an empty
+    database. A file that sorts first by name but depends on later ones must
+    not take that slot, or every finding behind it is swallowed.
+    """
+
+    def _migration(self, deps: str, operations: str) -> str:
+        return (
+            "from django.db import migrations, models\n\n"
+            "class Migration(migrations.Migration):\n"
+            f"    dependencies = {deps}\n"
+            "    operations = [\n"
+            f"{operations}"
+            "    ]\n"
+        )
+
+    def test_dependency_only_name_is_not_treated_as_the_first_migration(self) -> None:
+        with TemporaryDirectory() as tmp:
+            app = Path(tmp) / "shop"
+            _write(
+                app,
+                "0001_initial",
+                self._migration(
+                    "[]",
+                    "        migrations.CreateModel(name='Customer', fields=[]),\n",
+                ),
+            )
+            _write(
+                app,
+                "0002_customer_code",
+                self._migration(
+                    "[('shop', '0001_initial')]",
+                    "        migrations.AddField(model_name='customer', name='code',\n"
+                    "            field=models.CharField(max_length=10, null=True)),\n",
+                ),
+            )
+            _write(
+                app,
+                "add_rank",
+                self._migration(
+                    "[('shop', '0002_customer_code')]",
+                    "        migrations.AddField(model_name='customer', name='rank',\n"
+                    "            field=models.IntegerField()),\n",
+                ),
+            )
+            findings = analyze_migration_risks(tmp, current_schema=_empty_schema())
+
+        rules = _by_rule(findings)
+        self.assertIn("add_field_not_null_no_default", rules)
+        self.assertEqual(
+            [f.migration for f in rules["add_field_not_null_no_default"]], ["add_rank"]
+        )
+
+    def test_helper_module_does_not_take_a_migration_index(self) -> None:
+        # A constants module matches the filename filter and sorts before
+        # `0001_initial` (it has no numeric prefix), but it is not a migration:
+        # it must not push the app's first migration to index 1, where the
+        # table is assumed to hold rows.
+        with TemporaryDirectory() as tmp:
+            app = Path(tmp) / "shop"
+            _write(app, "branding", "ACCENT = 'blue'\n")
+            _write(
+                app,
+                "0001_initial",
+                self._migration(
+                    "[]",
+                    "        migrations.AddField(model_name='customer', name='rank',\n"
+                    "            field=models.IntegerField()),\n",
+                ),
+            )
+            findings = analyze_migration_risks(tmp, current_schema=_empty_schema())
+
+        self.assertNotIn("add_field_not_null_no_default", _by_rule(findings))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -242,6 +242,27 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(replayed, 2)
         self.assertEqual(state, {"post": {"title", "slug"}})
 
+    def test_cross_app_dependency_is_not_a_local_edge(self) -> None:
+        # `0001_initial` depends on `other/add_slug`, an app that is not this
+        # one; `add_slug.py` here merely shares the name. Matching on the name
+        # alone turned that into a local edge and, with `add_slug` depending on
+        # `0001_initial` back, a cycle whose fallback put `add_slug` first —
+        # where the later CreateModel reset its field.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="Post", fields=[("title", None)]),\n',
+            deps="[('other', 'add_slug')]",
+        )
+        self._write(
+            "add_slug.py",
+            '        migrations.AddField(model_name="post", name="slug",'
+            " field=models.SlugField()),\n",
+            deps="[('blog', '0001_initial')]",
+        )
+        state, replayed = replay_app(self.migrations)
+        self.assertEqual(replayed, 2)
+        self.assertEqual(state, {"post": {"title", "slug"}})
+
     def test_helper_module_without_migration_class_is_not_replayed(self) -> None:
         # `MIGRATION_FILENAME_RE` now accepts any module Django would import,
         # which also picks up constants/mixins. They are not migrations and

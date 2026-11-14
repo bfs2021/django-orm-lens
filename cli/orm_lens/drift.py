@@ -41,8 +41,7 @@ from .migrations_parser import (
     _find_migration_class,
     _iter_migration_files,
     _literal_or_none,
-    _migration_dependencies,
-    _migration_prefix,
+    _replay_order,
 )
 
 # Operations that change which fields a model has. AlterField is absent on
@@ -271,57 +270,6 @@ def _apply(state: dict[str, set[str]], op: str, call: ast.Call) -> None:
             fields.add(new)
 
 
-def _replay_order(parsed: list[tuple[Path, ast.Module]]) -> list[tuple[Path, ast.Module]]:
-    """Order parsed migrations the way Django applies them.
-
-    Django orders an app's migrations by their ``dependencies``; the numeric
-    prefix only breaks ties between files that do not depend on each other.
-    Sorting by prefix alone replayed a hand-renamed ``0001b_add_session_key``
-    (prefix 1) or a dependency-only name such as ``add_slug.py`` (prefix -1)
-    *before* ``0001_initial``, so their ``AddField`` landed on a model the
-    later ``CreateModel`` then reset.
-    """
-    by_stem = {path.stem: (path, tree) for path, tree in parsed}
-    local = set(by_stem)
-    deps: dict[str, list[str]] = {}
-    for stem, (_path, tree) in by_stem.items():
-        names = [
-            name
-            for _app, name in _migration_dependencies(_find_migration_class(tree))
-            if name in local and name != stem
-        ]
-        # A name listed twice must not make the file wait forever.
-        deps[stem] = list(dict.fromkeys(names))
-
-    dependents: dict[str, list[str]] = {stem: [] for stem in by_stem}
-    waiting = {stem: len(names) for stem, names in deps.items()}
-    for stem, names in deps.items():
-        for name in names:
-            dependents[name].append(stem)
-
-    def order_key(stem: str) -> tuple[int, str]:
-        return (_migration_prefix(stem), stem)
-
-    ready = sorted((stem for stem, count in waiting.items() if not count), key=order_key)
-    ordered: list[tuple[Path, ast.Module]] = []
-    while ready:
-        stem = ready.pop(0)
-        ordered.append(by_stem[stem])
-        for dependent in dependents[stem]:
-            waiting[dependent] -= 1
-            if not waiting[dependent]:
-                ready.append(dependent)
-                ready.sort(key=order_key)
-    if len(ordered) != len(by_stem):
-        # A dependency cycle is invalid for Django too; replay the remainder in
-        # filename order instead of dropping those files.
-        placed = {path.stem for path, _tree in ordered}
-        ordered.extend(
-            sorted((by_stem[stem] for stem in local - placed), key=lambda item: order_key(item[0].stem))
-        )
-    return ordered
-
-
 def replay_app(migrations_dir: Path) -> tuple[dict[str, set[str]], int]:
     """Replay one app's migrations into ``{model_lower: {field_names}}``.
 
@@ -342,7 +290,10 @@ def replay_app(migrations_dir: Path) -> tuple[dict[str, set[str]], int]:
             continue
         parsed.append((path, tree))
     replayed = len(parsed)
-    for _path, tree in _replay_order(parsed):
+    # The directory name is the app's package, which is its label unless
+    # `AppConfig.label` overrides it; `_replay_order` checks the dependency
+    # tuples before trusting it.
+    for _path, tree in _replay_order(parsed, app_label=migrations_dir.parent.name):
         for call in _operations(tree):
             op = _op_name(call)
             if op in _STRUCTURAL_OPS:
