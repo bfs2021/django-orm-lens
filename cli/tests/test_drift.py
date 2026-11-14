@@ -188,6 +188,28 @@ class ReplayTest(unittest.TestCase):
         state, _ = replay_app(self.migrations)
         self.assertEqual(state, {"entry": {"action"}})
 
+    def test_state_operations_ignore_a_class_level_name_bound_again_below(self) -> None:
+        # `state_operations=STATE` keeps the list STATE named at that point; a
+        # later `STATE = []` (bound to keep it away from the next migration in
+        # the same class) is a different object by then. Reading the last
+        # binding replayed the empty list, dropped the model, and that read as
+        # drift on a project Django sees no drift on.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE),\n"
+            + "    ]\n"
+            + "    STATE = []\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
     def test_delete_model_drops_it(self) -> None:
         self._write(
             "0001_initial.py",

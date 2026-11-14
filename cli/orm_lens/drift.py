@@ -164,10 +164,19 @@ def _create_model_fields(call: ast.Call) -> list[str]:
     return names
 
 
-def _body_lists(body: list[ast.stmt]) -> dict[str, ast.expr]:
-    """``NAME = [...]`` bindings in a module or class body, by name."""
+def _body_lists(body: list[ast.stmt], before: ast.stmt | None = None) -> dict[str, ast.expr]:
+    """``NAME = [...]`` bindings in a module or class body, by name.
+
+    With ``before``, only the bindings made before that statement. Python
+    evaluates the right-hand side where it is written, so ``state_operations=
+    STATE`` keeps the list ``STATE`` named at that point: a later ``STATE = []``
+    (bound to keep the list away from the next migration) is not what the
+    wrapper holds, and must not decide what the wrapper replays.
+    """
     lists: dict[str, ast.expr] = {}
     for node in body:
+        if node is before:
+            break
         if isinstance(node, ast.Assign):
             value = node.value
             names = [t.id for t in node.targets if isinstance(t, ast.Name)]
@@ -238,11 +247,13 @@ def _operations(tree: ast.AST) -> list[ast.Call]:
             continue
         # Django's own docs put shared lists on the ``Migration`` class, where
         # the name is only bound inside that class body — so class bindings
-        # shadow (and extend) the module-level ones for this assignment.
+        # shadow (and extend) the module-level ones for this assignment. Only
+        # the ones made before it: a name bound again below is a different
+        # object by then, and the wrapper keeps the one it was given.
         constants = dict(module_constants)
         for cls in ast.walk(tree):
             if isinstance(cls, ast.ClassDef) and any(stmt is node for stmt in cls.body):
-                constants.update(_body_lists(cls.body))
+                constants.update(_body_lists(cls.body, before=node))
                 break
         out.extend(_state_operations(node.value.elts, constants))
     return out
