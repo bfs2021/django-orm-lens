@@ -38,9 +38,10 @@ from typing import Any
 from .migrations_parser import (
     _build_current_schema,
     _find_all_migration_apps,
+    _find_migration_class,
     _iter_migration_files,
     _literal_or_none,
-    _migration_prefix,
+    _replay_order,
 )
 
 # Operations that change which fields a model has. AlterField is absent on
@@ -275,19 +276,24 @@ def replay_app(migrations_dir: Path) -> tuple[dict[str, set[str]], int]:
     :returns: the state, and how many migration files contributed to it.
     """
     state: dict[str, set[str]] = {}
-    files = sorted(
-        _iter_migration_files(migrations_dir),
-        key=lambda p: (_migration_prefix(p.stem), p.name),
-    )
-    replayed = 0
-    for path in files:
+    parsed: list[tuple[Path, ast.Module]] = []
+    for path in _iter_migration_files(migrations_dir):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
         except (OSError, SyntaxError):
             # A migration we cannot parse is skipped rather than fatal: one
             # bad file must not blank out the whole app's state.
             continue
-        replayed += 1
+        if _find_migration_class(tree) is None:
+            # Helper modules (constants, mixins) match the filename filter but
+            # are not migrations, so they contribute no operations.
+            continue
+        parsed.append((path, tree))
+    replayed = len(parsed)
+    # The directory name is the app's package, which is its label unless
+    # `AppConfig.label` overrides it; `_replay_order` checks the dependency
+    # tuples before trusting it.
+    for _path, tree in _replay_order(parsed, app_label=migrations_dir.parent.name):
         for call in _operations(tree):
             op = _op_name(call)
             if op in _STRUCTURAL_OPS:

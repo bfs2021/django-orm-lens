@@ -95,6 +95,37 @@ class MigrationConflictTests(unittest.TestCase):
     def test_single_migration_is_clean(self) -> None:
         self.assertEqual(_conflicts(_project([("0001_initial.py", "[]")])), [])
 
+    def test_short_numeric_prefix_is_a_migration_not_a_leaf_split(self) -> None:
+        """`008_...` is loaded by Django; skipping it left `0009` unlinked."""
+        root = _project(
+            [
+                ("0001_initial.py", "[]"),
+                ("0007_bigint.py", "[('shop', '0001_initial')]"),
+                ("008_remove_scheduled_mails.py", "[('shop', '0007_bigint')]"),
+                ("0009_after.py", "[('shop', '008_remove_scheduled_mails')]"),
+            ]
+        )
+        self.assertEqual(_conflicts(root), [])
+
+    def test_helper_module_is_not_a_leaf(self) -> None:
+        """Django imports every module in the package; only `Migration` counts.
+
+        A constants/mixins module beside a linear history used to parse as one
+        more root with no dependents — an extra leaf, i.e. a critical
+        `conflicting_migration_leaves` finding for a healthy app.
+        """
+        root = _project(
+            [
+                ("0001_initial.py", "[]"),
+                ("0002_add_slug.py", "[('shop', '0001_initial')]"),
+            ]
+        )
+        (Path(root) / "shop" / "migrations" / "helpers.py").write_text(
+            "from django.db import migrations\n\n\nNEW_FIELDS = []\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(_conflicts(root), [])
+
     def test_merge_migration_resolves_the_conflict(self) -> None:
         """The fix must not keep reporting the problem."""
         root = _project(

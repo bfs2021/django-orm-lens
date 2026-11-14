@@ -29,8 +29,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-MIGRATION_FILENAME_RE = re.compile(r"^\d{4}_.+\.py$")
-_MIGRATION_PREFIX_RE = re.compile(r"^(\d+)_")
+# Django's loader imports every module in the package whose name does not start
+# with "_" or "~", so a numeric prefix is not a reliable filter: hand-inserted
+# files such as ``0162b_auto_...py`` and legacy ``008_...py`` are real
+# migrations even though they do not start with four digits.
+MIGRATION_FILENAME_RE = re.compile(r"^[^_~].*\.py$")
+# The digits Django's autogenerator would have produced, even when a human
+# edited the rest of the name (``0162b_auto`` -> 162) or trimmed it (``008_x``).
+_MIGRATION_PREFIX_RE = re.compile(r"^(\d+)")
 
 # Skip patterns for filesystem walk (mirrors parser.py conventions).
 _SKIP_DIRS = frozenset(
@@ -144,38 +150,87 @@ def _extract_dependency_pairs(deps_node: ast.AST) -> list[list[str]]:
     return pairs
 
 
+def _find_migration_class(tree: ast.Module) -> ast.ClassDef | None:
+    """The first ``class Migration`` in a parsed module, if there is one.
+
+    Django's loader imports every module in the package; helper modules that
+    only hold constants or mixins sit next to real migrations. They match the
+    filename filter but carry no ``Migration`` class, so they are not
+    migrations and must not join the graph.
+    """
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "Migration":
+            return node
+    return None
+
+
+def _migration_dependencies(cls: ast.ClassDef | None) -> list[list[str]]:
+    """``dependencies = [(app, name), ...]`` out of a ``Migration`` class body.
+
+    Python keeps the *last* assignment to a class attribute, so a file that
+    rebinds ``dependencies`` is ordered by the value Django actually reads.
+    Returning on the first assignment ordered such a migration as if it
+    depended on nothing.
+    """
+    if cls is None:
+        return []
+    pairs: list[list[str]] = []
+    for stmt in cls.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        targets = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+        if "dependencies" in targets:
+            pairs = _extract_dependency_pairs(stmt.value)
+    return pairs
+
+
 def _parse_migration_file(path: Path) -> dict[str, Any] | None:
-    """Parse one migration file. Returns dict or ``None`` on unreadable/invalid."""
+    """Parse one migration file. Returns dict or ``None`` on unreadable/invalid.
+
+    A file with no ``class Migration`` is a helper module, not a migration:
+    returning ``None`` keeps it out of roots, leaves and the replay count.
+    """
+    tree = _read_migration_tree(path)
+    if tree is None:
+        return None
+    return _describe_migration(path, tree)
+
+
+def _read_migration_tree(path: Path) -> ast.Module | None:
+    """The AST of one migration module, or ``None`` if it cannot be read."""
     try:
         source = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     try:
-        tree = ast.parse(source, filename=str(path))
+        return ast.parse(source, filename=str(path))
     except SyntaxError:
         return None
 
+
+def _describe_migration(path: Path, tree: ast.Module) -> dict[str, Any] | None:
+    """Summarise an already-parsed module; ``None`` when it is not a migration.
+
+    Django imports every module in the package; helper modules that only hold
+    constants or mixins match the filename filter but carry no ``Migration``
+    class, so they are not nodes of the migration graph.
+    """
     name = path.stem  # e.g. "0042_add_user_email"
-    dependencies: list[list[str]] = []
+    cls = _find_migration_class(tree)
+    if cls is None:
+        return None
+    dependencies: list[list[str]] = _migration_dependencies(cls)
     operations: list[str] = []
     replaces: list[list[str]] = []
 
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
+    for stmt in cls.body:
+        if not isinstance(stmt, ast.Assign):
             continue
-        if node.name != "Migration":
-            continue
-        for stmt in node.body:
-            if not isinstance(stmt, ast.Assign):
-                continue
-            targets = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
-            if "dependencies" in targets:
-                dependencies = _extract_dependency_pairs(stmt.value)
-            elif "operations" in targets:
-                operations = _extract_operation_names(stmt.value)
-            elif "replaces" in targets:
-                replaces = _extract_dependency_pairs(stmt.value)
-        break  # only the first class named Migration counts
+        targets = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+        if "operations" in targets:
+            operations = _extract_operation_names(stmt.value)
+        elif "replaces" in targets:
+            replaces = _extract_dependency_pairs(stmt.value)
 
     out: dict[str, Any] = {
         "name": name,
@@ -477,6 +532,104 @@ def _migration_prefix(name: str) -> int:
         return int(m.group(1))
     except ValueError:
         return -1
+
+
+def _resolve_app_label(deps_by_name: dict[str, list[list[str]]], app_label: str) -> str | None:
+    """The label this app's migrations use in their ``dependencies`` tuples.
+
+    Dependency tuples carry the app *label*, which is the package name by
+    default but can be overridden through ``AppConfig.label``, so the directory
+    name is only a guess. Every dependency that points at a file present in
+    this directory was written by this app (Django refuses to apply an app's
+    migration before a dependency that does not exist), so the labels on those
+    tuples are the candidates. Prefer the directory name when it appears, take
+    a lone alternative, and stay silent when the evidence is ambiguous.
+    """
+    local = set(deps_by_name)
+    labels = {
+        dep[0]
+        for pairs in deps_by_name.values()
+        for dep in pairs
+        if len(dep) > 1 and dep[1] in local
+    }
+    if app_label in labels:
+        return app_label
+    if len(labels) == 1:
+        return next(iter(labels))
+    return None
+
+
+def _replay_order(
+    parsed: list[tuple[Path, ast.Module]], *, app_label: str | None = None
+) -> list[tuple[Path, ast.Module]]:
+    """Order parsed migrations the way Django applies them.
+
+    Django orders an app's migrations by their ``dependencies``; the numeric
+    prefix only breaks ties between files that do not depend on each other.
+    Sorting by prefix alone replayed a hand-renamed ``0001b_add_session_key``
+    (prefix 1) or a dependency-only name such as ``add_slug.py`` (prefix -1)
+    *before* ``0001_initial``, so their ``AddField`` landed on a model the
+    later ``CreateModel`` then reset.
+
+    :param app_label: directory-derived label used to tell an in-app dependency
+        from a cross-app one whose migration happens to share a local file's
+        name. Without it every name that matches a local file is an edge.
+    """
+    by_stem = {path.stem: (path, tree) for path, tree in parsed}
+    local = set(by_stem)
+    deps_by_name = {
+        stem: _migration_dependencies(_find_migration_class(tree))
+        for stem, (_path, tree) in by_stem.items()
+    }
+    label = _resolve_app_label(deps_by_name, app_label) if app_label is not None else None
+
+    deps: dict[str, list[str]] = {}
+    for stem, pairs in deps_by_name.items():
+        names: list[str] = []
+        for dep in pairs:
+            if len(dep) < 2:
+                continue
+            dep_app, name = dep[0], dep[1]
+            if name not in local or name == stem:
+                continue
+            # A dependency on another app is not an edge in this app's graph,
+            # even when a migration here happens to share its name.
+            if label is not None and dep_app != label:
+                continue
+            names.append(name)
+        # A name listed twice must not make the file wait forever.
+        deps[stem] = list(dict.fromkeys(names))
+
+    dependents: dict[str, list[str]] = {stem: [] for stem in by_stem}
+    waiting = {stem: len(names) for stem, names in deps.items()}
+    for stem, names in deps.items():
+        for name in names:
+            dependents[name].append(stem)
+
+    def order_key(stem: str) -> tuple[int, str]:
+        return (_migration_prefix(stem), stem)
+
+    ready = sorted((stem for stem, count in waiting.items() if not count), key=order_key)
+    ordered: list[tuple[Path, ast.Module]] = []
+    while ready:
+        stem = ready.pop(0)
+        ordered.append(by_stem[stem])
+        for dependent in dependents[stem]:
+            waiting[dependent] -= 1
+            if not waiting[dependent]:
+                ready.append(dependent)
+                ready.sort(key=order_key)
+    if len(ordered) != len(by_stem):
+        # A dependency cycle is invalid for Django too; replay the remainder in
+        # filename order instead of dropping those files.
+        placed = {path.stem for path, _tree in ordered}
+        ordered.extend(
+            sorted(
+                (by_stem[stem] for stem in local - placed),
+                key=lambda item: order_key(item[0].stem),
+            )
+        )
+    return ordered
 
 
 def _find_all_migration_apps(project_root: str) -> list[tuple[str, Path]]:
@@ -1281,14 +1434,29 @@ def analyze_migration_risks(
     for app_label, dirs in by_app.items():
         # Flatten + dedupe by filename (mono-repos may vendor the same app).
         seen: set = set()
-        ordered_files: list[Path] = []
+        candidates: list[Path] = []
         for _mig_dir, files in dirs:
             for f in files:
                 if f.name in seen:
                     continue
                 seen.add(f.name)
-                ordered_files.append(f)
-        ordered_files.sort(key=lambda p: (_migration_prefix(p.stem), p.name))
+                candidates.append(f)
+
+        # Parse once: replay order needs the trees, and a module without a
+        # `Migration` class is not a migration at all. Dropping those here
+        # keeps them from taking a migration index — the risky-operation
+        # heuristic treats index 0 as "the table is still empty", so a helper
+        # module sorted first used to hide every finding behind it. The order
+        # itself is Django's: dependencies first, the numeric prefix only
+        # breaks ties.
+        trees: list[tuple[Path, ast.Module]] = []
+        for path in candidates:
+            tree = _read_migration_tree(path)
+            if tree is not None and _find_migration_class(tree) is not None:
+                trees.append((path, tree))
+        ordered = _replay_order(trees, app_label=app_label)
+        ordered_files = [path for path, _tree in ordered]
+        parsed = [m for m in (_describe_migration(p, t) for p, t in ordered) if m]
 
         app_findings: list[tuple[int, MigrationRisk]] = []
         # (migration index, line, model, field-or-None) for every operation in
@@ -1318,32 +1486,18 @@ def analyze_migration_risks(
         # reports this once you have a working settings module and database,
         # which is exactly what nobody has on a fresh clone or in a CI job that
         # has not booted Django yet.
-        parsed = [m for m in (_parse_migration_file(p) for p in ordered_files) if m]
         if len(parsed) > 1:
             # `app_label` comes from the directory name, but Django lets an app
             # declare `AppConfig.label` different from its package — and the
             # dependency tuples use the *label*. Leafness computed against the
             # wrong label sees no in-app edges at all and calls every migration
             # a leaf, which would report a critical conflict for a perfectly
-            # linear history.
-            #
-            # Recover the real label: whichever label appears in a dependency
-            # pointing at a migration file that exists in this directory. If
-            # that is ambiguous, or nothing references us, stay silent — a
-            # false "your migrations conflict" is worse than a missed one.
-            local_names = {m["name"] for m in parsed}
-            candidates = {
-                dep[0]
-                for m in parsed
-                for dep in m["dependencies"]
-                if dep[1] in local_names
-            }
-            effective_label = (
-                app_label
-                if app_label in candidates
-                else next(iter(candidates))
-                if len(candidates) == 1
-                else None
+            # linear history. `_resolve_app_label` recovers the real one from
+            # the dependencies that point at files in this directory, and stays
+            # silent when they are ambiguous: a false "your migrations
+            # conflict" is worse than a missed one.
+            effective_label = _resolve_app_label(
+                {m["name"]: m["dependencies"] for m in parsed}, app_label
             )
             leaves = (
                 _compute_roots_leaves_cross(

@@ -45,8 +45,8 @@ class ReplayTest(unittest.TestCase):
         self.migrations = self.root / "blog" / "migrations"
         self.migrations.mkdir(parents=True)
 
-    def _write(self, name: str, body: str) -> None:
-        (self.migrations / name).write_text(_migration(body), encoding="utf-8")
+    def _write(self, name: str, body: str, deps: str = "[]") -> None:
+        (self.migrations / name).write_text(_migration(body, deps), encoding="utf-8")
 
     def test_create_model_seeds_the_field_set(self) -> None:
         self._write(
@@ -204,6 +204,79 @@ class ReplayTest(unittest.TestCase):
             '        migrations.RemoveField(model_name="post", name="slug"),\n',
         )
         self.assertEqual(replay_app(self.migrations)[0], {"post": {"title"}})
+
+    def test_hand_renamed_migration_keeps_its_place(self) -> None:
+        # Django loads any module in the package, so `0001b_` is a real
+        # migration. It has to replay *after* `0001_initial`: sorting it as -1
+        # puts it first and the CreateModel that follows resets the field set.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="CachedFile", fields=['
+            '("filename", None)]),\n',
+        )
+        self._write(
+            "0001b_add_session_key.py",
+            '        migrations.AddField(model_name="cachedfile",'
+            ' name="session_key", field=models.TextField(null=True)),\n',
+            deps="[('blog', '0001_initial')]",
+        )
+        state, replayed = replay_app(self.migrations)
+        self.assertEqual(replayed, 2)
+        self.assertEqual(state, {"cachedfile": {"filename", "session_key"}})
+
+    def test_dependency_only_name_replays_after_its_parent(self) -> None:
+        # `add_slug.py` has no numeric prefix at all — Django applies it where
+        # its `dependencies` say, which is after `0001_initial`. Applying it
+        # first added the field to an empty state that CreateModel then reset.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="Post", fields=[("title", None)]),\n',
+        )
+        self._write(
+            "add_slug.py",
+            '        migrations.AddField(model_name="post", name="slug",'
+            " field=models.SlugField()),\n",
+            deps="[('blog', '0001_initial')]",
+        )
+        state, replayed = replay_app(self.migrations)
+        self.assertEqual(replayed, 2)
+        self.assertEqual(state, {"post": {"title", "slug"}})
+
+    def test_cross_app_dependency_is_not_a_local_edge(self) -> None:
+        # `0001_initial` depends on `other/add_slug`, an app that is not this
+        # one; `add_slug.py` here merely shares the name. Matching on the name
+        # alone turned that into a local edge and, with `add_slug` depending on
+        # `0001_initial` back, a cycle whose fallback put `add_slug` first —
+        # where the later CreateModel reset its field.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="Post", fields=[("title", None)]),\n',
+            deps="[('other', 'add_slug')]",
+        )
+        self._write(
+            "add_slug.py",
+            '        migrations.AddField(model_name="post", name="slug",'
+            " field=models.SlugField()),\n",
+            deps="[('blog', '0001_initial')]",
+        )
+        state, replayed = replay_app(self.migrations)
+        self.assertEqual(replayed, 2)
+        self.assertEqual(state, {"post": {"title", "slug"}})
+
+    def test_helper_module_without_migration_class_is_not_replayed(self) -> None:
+        # `MIGRATION_FILENAME_RE` now accepts any module Django would import,
+        # which also picks up constants/mixins. They are not migrations and
+        # must not count towards `replayed`.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="Post", fields=[("title", None)]),\n',
+        )
+        (self.migrations / "constants.py").write_text(
+            "FIELDS = ('title',)\n", encoding="utf-8"
+        )
+        state, replayed = replay_app(self.migrations)
+        self.assertEqual(replayed, 1)
+        self.assertEqual(state, {"post": {"title"}})
 
     def test_unparseable_migration_is_skipped_not_fatal(self) -> None:
         self._write(
