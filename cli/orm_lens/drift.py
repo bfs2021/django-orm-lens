@@ -164,16 +164,39 @@ def _create_model_fields(call: ast.Call) -> list[str]:
     return names
 
 
-def _body_lists(body: list[ast.stmt], before: ast.stmt | None = None) -> dict[str, ast.expr]:
-    """``NAME = [...]`` bindings in a module or class body, by name.
+@dataclass
+class _ListBinding:
+    """A ``NAME = [...]`` value and the bindings it could see when built.
+
+    A list is built once, so names inside it resolve against the bindings
+    made before the assignment — never whatever the body later rebinds them
+    to.
+    """
+
+    value: ast.expr
+    env: dict[str, _ListBinding]
+
+
+def _body_lists(
+    body: list[ast.stmt],
+    before: ast.stmt | None = None,
+    base: dict[str, _ListBinding] | None = None,
+) -> dict[str, _ListBinding]:
+    """Resolvable ``NAME = [...]`` bindings visible in a body, by name.
 
     With ``before``, only the bindings made before that statement. Python
     evaluates the right-hand side where it is written, so ``state_operations=
     STATE`` keeps the list ``STATE`` named at that point: a later ``STATE = []``
     (bound to keep the list away from the next migration) is not what the
     wrapper holds, and must not decide what the wrapper replays.
+
+    Each list keeps the bindings it was built with, so a nested wrapper
+    resolves the names it captured even when they are rebound afterwards. A
+    later assignment to a name wins even when its value cannot be resolved,
+    and shadows an enclosing binding of the same spelling rather than falling
+    back to it. ``base`` seeds the bindings visible from the enclosing scope.
     """
-    lists: dict[str, ast.expr] = {}
+    lists: dict[str, _ListBinding] = dict(base or {})
     for node in body:
         if node is before:
             break
@@ -185,13 +208,26 @@ def _body_lists(body: list[ast.stmt], before: ast.stmt | None = None) -> dict[st
             names = [node.target.id] if isinstance(node.target, ast.Name) else []
         else:
             continue
+        binding: _ListBinding | None
         if isinstance(value, (ast.List, ast.Tuple)):
-            for name in names:
-                lists[name] = value
+            binding = _ListBinding(value, dict(lists))
+        elif isinstance(value, ast.Name) and value.id in lists:
+            # ``STATE = EMPTY`` keeps the same list object, and that list
+            # resolved its own names when it was built.
+            binding = lists[value.id]
+        else:
+            # The name now holds something we cannot resolve. The earlier
+            # list is still reachable through a binding that captured it.
+            binding = None
+        for name in names:
+            if binding is None:
+                lists.pop(name, None)
+            else:
+                lists[name] = binding
     return lists
 
 
-def _module_level_lists(tree: ast.AST) -> dict[str, ast.expr]:
+def _module_level_lists(tree: ast.AST) -> dict[str, _ListBinding]:
     """Module-scope ``NAME = [...]`` bindings, by name.
 
     Hand-written migrations sometimes hoist a shared operations list into a
@@ -201,7 +237,11 @@ def _module_level_lists(tree: ast.AST) -> dict[str, ast.expr]:
     return _body_lists(getattr(tree, "body", []))
 
 
-def _state_operations(elts: list[ast.expr], constants: dict[str, ast.expr]) -> list[ast.Call]:
+def _state_operations(
+    elts: list[ast.expr],
+    constants: dict[str, _ListBinding],
+    seen: frozenset[int] = frozenset(),
+) -> list[ast.Call]:
     """Flatten ``SeparateDatabaseAndState`` into the operations it wraps.
 
     Django builds project state from ``state_operations`` only; the wrapper
@@ -209,27 +249,33 @@ def _state_operations(elts: list[ast.expr], constants: dict[str, ast.expr]) -> l
     without touching the table. ``database_operations`` is SQL-only and must
     not seed fields.
 
-    A literal list, a tuple, or a module-level name bound to one is replayed;
-    anything else (a call, a comprehension, a name we cannot resolve) is
-    skipped, like every other construct this parser cannot evaluate.
+    A literal list, a tuple, or a name bound to one is replayed; anything else
+    (a call, a comprehension, a name we cannot resolve) is skipped, like every
+    other construct this parser cannot evaluate. A name resolves against the
+    bindings its list saw when it was built, and ``seen`` stops a binding that
+    somehow points back into itself instead of recursing forever.
     """
     out: list[ast.Call] = []
     for elt in elts:
         if not isinstance(elt, ast.Call):
             continue
-        if _op_name(elt) == "SeparateDatabaseAndState":
-            # Signature: (database_operations, state_operations) — real
-            # projects use the keyword form, but the positional one is cheap.
-            state_node = elt.args[1] if len(elt.args) > 1 else None
-            for kw in elt.keywords:
-                if kw.arg == "state_operations":
-                    state_node = kw.value
-            while isinstance(state_node, ast.Name) and state_node.id in constants:
-                state_node = constants[state_node.id]
-            if isinstance(state_node, (ast.List, ast.Tuple)):
-                out.extend(_state_operations(state_node.elts, constants))
+        if _op_name(elt) != "SeparateDatabaseAndState":
+            out.append(elt)
             continue
-        out.append(elt)
+        # Signature: (database_operations, state_operations) — real
+        # projects use the keyword form, but the positional one is cheap.
+        state_node = elt.args[1] if len(elt.args) > 1 else None
+        for kw in elt.keywords:
+            if kw.arg == "state_operations":
+                state_node = kw.value
+        env = constants
+        if isinstance(state_node, ast.Name):
+            binding = constants.get(state_node.id)
+            if binding is None:
+                continue
+            state_node, env = binding.value, binding.env
+        if isinstance(state_node, (ast.List, ast.Tuple)) and id(state_node) not in seen:
+            out.extend(_state_operations(state_node.elts, env, seen | {id(state_node)}))
     return out
 
 
@@ -250,10 +296,10 @@ def _operations(tree: ast.AST) -> list[ast.Call]:
         # shadow (and extend) the module-level ones for this assignment. Only
         # the ones made before it: a name bound again below is a different
         # object by then, and the wrapper keeps the one it was given.
-        constants = dict(module_constants)
+        constants = module_constants
         for cls in ast.walk(tree):
             if isinstance(cls, ast.ClassDef) and any(stmt is node for stmt in cls.body):
-                constants.update(_body_lists(cls.body, before=node))
+                constants = _body_lists(cls.body, before=node, base=module_constants)
                 break
         out.extend(_state_operations(node.value.elts, constants))
     return out

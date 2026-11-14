@@ -210,6 +210,89 @@ class ReplayTest(unittest.TestCase):
         state, _ = replay_app(self.migrations)
         self.assertEqual(state, {"entry": {"action"}})
 
+    def test_state_operations_rebinding_to_an_empty_list_is_not_replayed(self) -> None:
+        # `STATE = EMPTY` replaces the class name before the wrapper reads it,
+        # so Python hands the wrapper an empty list. Keeping the first binding
+        # replays a model Django never sees, which reads as false drift.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    EMPTY = []\n"
+            + "    STATE = EMPTY\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {})
+
+    def test_state_operations_rebinding_to_a_call_shadows_the_module_name(self) -> None:
+        # A class body that rebinds the name to something unresolvable still
+        # shadows a module-level list of the same spelling for the rest of the
+        # body. Falling back to the module binding replays operations the
+        # wrapper never received.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "STATE_OPS = [\n"
+            + "    migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "]\n\n\n"
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE_OPS = build_state_operations()\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE_OPS),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {})
+
+    def test_state_operations_nested_wrappers_resolve_where_they_were_built(self) -> None:
+        # The second STATE captures the first list. Resolving the inner name
+        # against the final mapping finds the outer list instead and recurses
+        # into it forever.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    STATE = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE),\n"
+            + "    ]\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
+    def test_state_operations_alias_replays_the_list_it_points_at(self) -> None:
+        # `COPY = STATE` is the same list object, so a wrapper reading COPY
+        # replays what STATE held when COPY was bound.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    COPY = STATE\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=COPY),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
     def test_delete_model_drops_it(self) -> None:
         self._write(
             "0001_initial.py",
