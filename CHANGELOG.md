@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **nplusone: no `select_related` for a scalar when the loop's model is
+  unknown** ([#251](https://github.com/FROWNINGdev/orm-lens/issues/251)).
+  `for e in self.events.all(): e.date_from.astimezone(tz)` was guessed to be a
+  foreign key and got `.select_related("date_from")`, which Django rejects. A
+  name that is a scalar on every model that has it is now skipped. A name that
+  is a relation on at least one model, or on none, is still guessed at
+  `medium`.
+
 ## [py-1.18.0] - 2026-11-11
 
 > Fewer false drift alarms on django-oscar-style and moved models.

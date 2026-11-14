@@ -1363,6 +1363,7 @@ class NPlusOneScanner(ast.NodeVisitor):
                     kind_hint == "chain"
                     and "*" not in select_set
                     and attr not in select_set
+                    and not (model_root is None and self._scalar_on_every_model(attr))
                 ):
                     uncovered_fk.append(attr)
 
@@ -1402,6 +1403,11 @@ class NPlusOneScanner(ast.NodeVisitor):
                 confidence=confidence,
             )
         )
+
+    def _scalar_on_every_model(self, attr: str) -> bool:
+        """True when ``attr`` exists in the schema and every model that has it says scalar."""
+        kinds = {attrs[attr] for attrs in self.models_schema.values() if attr in attrs}
+        return kinds == {"scalar"}
 
     def _relation_hops(
         self, model: str | None, parts: list[str],

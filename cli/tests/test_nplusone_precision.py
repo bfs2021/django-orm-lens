@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 from orm_lens.cli import main
+from orm_lens.parser import scan_workspace
 from orm_lens.query_analyzer import scan_for_nplusone
 from tests.test_nplusone_detector import BLOG_SCHEMA, _write
 
@@ -173,3 +174,60 @@ def test_model_reached_through_the_models_module_is_resolved(tmp_path: Path) -> 
     assert finding.accessed == ["child"]
     assert finding.confidence == "high"
     assert finding.suggested_fix == '.select_related("child")'
+
+
+def test_unknown_loop_model_skips_names_that_are_scalar_on_every_model(tmp_path: Path) -> None:
+    # pretix exporters/events.py: `for e in self.events.all()` does not root at
+    # a model, so `e.date_from.astimezone(tz)` got select_related("date_from").
+    _write(
+        tmp_path / "events" / "models.py",
+        "from django.db import models\n"
+        "\n"
+        "\n"
+        "class Organizer(models.Model):\n"
+        "    name = models.CharField(max_length=100)\n"
+        "\n"
+        "\n"
+        "class Event(models.Model):\n"
+        "    organizer = models.ForeignKey(Organizer, on_delete=models.CASCADE, related_name=\"events\")\n"
+        "    date_from = models.DateTimeField()\n"
+        "    date_to = models.DateTimeField(null=True)\n",
+    )
+    _write(
+        tmp_path / "events" / "exporters.py",
+        "class EventExporter:\n"
+        "    def __init__(self, organizer, tz):\n"
+        "        self.organizer = organizer\n"
+        "        self.tz = tz\n"
+        "\n"
+        "    def rows(self):\n"
+        "        for e in self.organizer.events.all():\n"
+        "            yield [\n"
+        "                e.date_from.astimezone(self.tz).isoformat(),\n"
+        "                e.date_to.astimezone(self.tz).isoformat() if e.date_to else \"\",\n"
+        "            ]\n"
+        "\n"
+        "    def organizers(self):\n"
+        "        for e in self.organizer.events.all():\n"
+        "            yield e.organizer.name\n",
+    )
+    (finding,) = scan_for_nplusone(str(tmp_path), scan_workspace(str(tmp_path)))
+    assert finding.line == 14
+    assert finding.accessed == ["organizer"]
+    assert finding.confidence == "medium"
+
+
+def test_unknown_loop_model_still_guesses_names_that_are_a_relation_somewhere(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "views.py",
+        "def rows(things):\n"
+        "    for x in things.all():\n"
+        "        print(x.owner.name, x.title.upper(), x.missing.value)\n",
+    )
+    schema = {
+        "Note": {"owner": "scalar", "title": "scalar"},
+        "Ticket": {"owner": "fk"},
+    }
+    (finding,) = scan_for_nplusone(str(tmp_path), schema)
+    assert finding.accessed == ["owner", "missing"]
+    assert finding.confidence == "medium"
